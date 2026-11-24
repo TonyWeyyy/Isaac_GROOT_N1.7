@@ -562,23 +562,19 @@ class LeRobotEpisodeLoader:
             raise ValueError(f"Language key {lang_key} not supported")
         return new_languages
 
-    def __getitem__(self, idx: int) -> pd.DataFrame:
+    def load_episode(
+        self,
+        idx: int,
+        video_indices: np.ndarray | list[int] | None = None,
+    ) -> pd.DataFrame:
         """
-        Load complete episode data as a processed DataFrame.
+        Load episode data as a processed DataFrame, optionally decoding only a subset of
+        video/mask frames.
 
-        Combines parquet data loading and video decoding to create a unified DataFrame
-        containing all modality data for the episode. Video frames are converted to
-        PIL Images and stored in the DataFrame.
-
-        Args:
-            idx: Episode index to load
-
-        Returns:
-            DataFrame with columns for all modalities and timestamps, with video frames
-            as PIL Images ready for further processing
-
-        Raises:
-            IndexError: If episode index is out of bounds
+        When ``video_indices`` is provided, only those frame indices are decoded from
+        video/mask files (massive speedup when a shard only samples a fraction of an
+        episode). Non-requested frame slots are left as ``None`` so DataFrame row
+        indexing remains aligned with parquet timesteps.
         """
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Episode index {idx} out of bounds")
@@ -600,25 +596,58 @@ class LeRobotEpisodeLoader:
         actual_length = min(len(df), nominal_length)
         df = df.iloc[:actual_length]
 
-        # Load synchronized video data
-        video_data = self._load_video_data(episode_id, np.arange(actual_length))
+        if video_indices is None:
+            indices_to_decode = np.arange(actual_length, dtype=np.int64)
+            sparse = False
+        else:
+            raw_indices = np.asarray(video_indices, dtype=np.int64)
+            valid_mask = (raw_indices >= 0) & (raw_indices < actual_length)
+            indices_to_decode = np.unique(raw_indices[valid_mask])
+            sparse = len(indices_to_decode) < actual_length
 
-        # Add video frames to dataframe as PIL Images
-        for key in video_data.keys():
-            assert len(video_data[key]) == len(df), (
-                f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
-            )
-            df[f"video.{key}"] = [frame for frame in video_data[key]]
+        # Load synchronized video data (full or on-demand subset)
+        if len(indices_to_decode) > 0:
+            video_data = self._load_video_data(episode_id, indices_to_decode)
+        else:
+            video_data = {}
 
-        # Load synchronized mask data
-        mask_data = self._load_mask_data(episode_id, np.arange(actual_length))
-        for key in mask_data.keys():
-            assert len(mask_data[key]) == len(df), (
-                f"Mask data for {key} has length {len(mask_data[key])} but dataframe has length {len(df)}"
-            )
-            df[f"mask.{key}"] = [mask for mask in mask_data[key]]
+        for key, frames in video_data.items():
+            if not sparse:
+                assert len(frames) == len(df), (
+                    f"Video data for {key} has length {len(frames)} but dataframe has length {len(df)}"
+                )
+                df[f"video.{key}"] = [frame for frame in frames]
+            else:
+                sparse_frames: list[Any] = [None] * actual_length
+                for frame_idx, frame in zip(indices_to_decode, frames):
+                    sparse_frames[int(frame_idx)] = frame
+                df[f"video.{key}"] = sparse_frames
+
+        # Load synchronized mask data (full or on-demand subset)
+        if len(indices_to_decode) > 0:
+            mask_data = self._load_mask_data(episode_id, indices_to_decode)
+        else:
+            mask_data = {}
+
+        for key, masks in mask_data.items():
+            if not sparse:
+                assert len(masks) == len(df), (
+                    f"Mask data for {key} has length {len(masks)} but dataframe has length {len(df)}"
+                )
+                df[f"mask.{key}"] = [mask for mask in masks]
+            else:
+                sparse_masks: list[Any] = [None] * actual_length
+                for frame_idx, mask in zip(indices_to_decode, masks):
+                    sparse_masks[int(frame_idx)] = mask
+                df[f"mask.{key}"] = sparse_masks
 
         return df
+
+    def __getitem__(self, idx: int) -> pd.DataFrame:
+        """
+        Load complete episode data as a processed DataFrame.
+        """
+        return self.load_episode(idx, video_indices=None)
 
     def get_initial_actions(self):
         """

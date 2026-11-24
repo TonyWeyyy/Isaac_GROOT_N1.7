@@ -68,6 +68,7 @@ class StateActionProcessor:
         clip_outliers: bool = True,
         apply_sincos_state_encoding: bool = False,
         use_relative_action: bool = False,
+        use_mean_std: bool = False,
     ):
         """
         Initialize unified state and action processor.
@@ -85,6 +86,8 @@ class StateActionProcessor:
             use_percentiles: Whether to use percentiles (q01/q99) instead of min/max
             clip_outliers: Whether to clip normalized values to [-1, 1]
             apply_sincos_state_encoding: Global flag to enable sin/cos encoding for states
+            use_relative_action: Whether to convert RELATIVE actions to/from relative representation
+            use_mean_std: Global flag to use mean/std (z-score) normalization instead of min/max
         """
         self.modality_configs = parse_modality_configs(modality_configs)
         self.statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
@@ -92,6 +95,7 @@ class StateActionProcessor:
         self.clip_outliers = clip_outliers
         self.apply_sincos_state_encoding = apply_sincos_state_encoding
         self.use_relative_action = use_relative_action
+        self.use_mean_std = use_mean_std
 
         # Normalization parameters computed from statistics
         self.norm_params: dict[str, dict[str, dict[str, dict[str, np.ndarray]]]] = {}
@@ -198,10 +202,14 @@ class StateActionProcessor:
                                     f"in embodiment '{embodiment_tag}' but not found"
                                 )
                             action_dim = self.norm_params[embodiment_tag]["action"][key]["dim"]
-                            self.norm_params[embodiment_tag]["action"][key] = nested_dict_to_numpy(
+                            rel_params = nested_dict_to_numpy(
                                 self.statistics[embodiment_tag]["relative_action"][key]
                             )
-                            self.norm_params[embodiment_tag]["action"][key]["dim"] = action_dim
+                            if self.use_percentiles and "q01" in rel_params and "q99" in rel_params:
+                                rel_params["min"] = rel_params["q01"]
+                                rel_params["max"] = rel_params["q99"]
+                            rel_params["dim"] = action_dim
+                            self.norm_params[embodiment_tag]["action"][key] = rel_params
 
     def apply_state(
         self,
@@ -242,7 +250,7 @@ class StateActionProcessor:
                 normalized_values[joint_group] = apply_sin_cos_encoding(state[joint_group])
 
             # Strategy 2: Mean/std normalization
-            elif (
+            elif self.use_mean_std or (
                 hasattr(
                     self.modality_configs[embodiment_tag]["state"],
                     "mean_std_embedding_keys",
@@ -308,7 +316,7 @@ class StateActionProcessor:
                 )
 
             # Reverse mean/std normalization
-            elif (
+            elif self.use_mean_std or (
                 hasattr(
                     self.modality_configs[embodiment_tag]["state"],
                     "mean_std_embedding_keys",
@@ -402,17 +410,17 @@ class StateActionProcessor:
                 )
 
             params = self.norm_params[embodiment_tag]["action"][joint_group]
-            if (
+            use_zscore = self.use_mean_std or (
                 self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys is not None
                 and joint_group
                 in self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys
-            ):
+            )
+            if use_zscore:
                 normalized = normalize_values_meanstd(action[joint_group], params)
             else:
                 normalized = normalize_values_minmax(action[joint_group], params)
-
-            if self.clip_outliers:
-                normalized = np.clip(normalized, -1.0, 1.0)
+                if self.clip_outliers:
+                    normalized = np.clip(normalized, -1.0, 1.0)
 
             normalized_values[joint_group] = normalized
 
@@ -459,7 +467,7 @@ class StateActionProcessor:
             params = self.norm_params[embodiment_tag]["action"][joint_group]
             group_values = action[joint_group]
 
-            if (
+            if self.use_mean_std or (
                 self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys is not None
                 and joint_group
                 in self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys

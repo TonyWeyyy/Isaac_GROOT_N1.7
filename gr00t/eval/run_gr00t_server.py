@@ -13,15 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import importlib
 import json
 import os
 from pathlib import Path
 import sys
+import time
 
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig
+from gr00t.deployment.modes import InferenceMode
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from gr00t.policy.replay_policy import ReplayPolicy
 from gr00t.policy.server_client import PolicyServer
@@ -81,11 +84,29 @@ class ServerConfig:
     port: int = DEFAULT_MODEL_SERVER_PORT
     """Port number for the server"""
 
+    api_token: str | None = None
+    """Optional API token required on incoming requests"""
+
     strict: bool = True
     """Whether to enforce strict input and output validation"""
 
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
+
+    denoising_steps: int | None = None
+    """Override number of flow-matching denoising steps (default: checkpoint config value)"""
+
+    trt_engine_path: str = ""
+    """Optional TensorRT engine directory or .engine file for accelerated inference"""
+
+    trt_mode: InferenceMode = InferenceMode.n17_full_pipeline
+    """TensorRT engine subset to attach when --trt-engine-path is set"""
+
+    warmup: bool = True
+    """Run one dummy inference before listening to eliminate first-request CUDA jitter"""
+
+    warmup_image_size: tuple[int, int] = (480, 640)
+    """(height, width) used for startup warmup dummy frames"""
 
 
 def main(config: ServerConfig):
@@ -96,6 +117,12 @@ def main(config: ServerConfig):
     print(f"  Device: {config.device}")
     print(f"  Host: {config.host}")
     print(f"  Port: {config.port}")
+    if config.denoising_steps is not None:
+        print(f"  Denoising steps: {config.denoising_steps}")
+    if config.trt_engine_path:
+        print(f"  TensorRT engine: {config.trt_engine_path} (mode={config.trt_mode})")
+
+    engine_cleanup = nullcontext()
 
     # Create and start the server
     if config.model_path is not None:
@@ -108,6 +135,34 @@ def main(config: ServerConfig):
             device=config.device,
             strict=config.strict,
         )
+        if config.denoising_steps is not None:
+            if config.denoising_steps <= 0:
+                raise ValueError(
+                    f"--denoising-steps must be positive; got {config.denoising_steps}."
+                )
+            policy.model.action_head.num_inference_timesteps = config.denoising_steps
+
+        if config.trt_engine_path:
+            deploy_dir = str(Path(__file__).resolve().parents[2] / "scripts" / "deployment")
+            if deploy_dir not in sys.path:
+                sys.path.insert(0, deploy_dir)
+            from trt.trt_model_forward import (
+                close_tensorrt_engines,
+                closing_tensorrt_engines,
+                setup_tensorrt_engines,
+            )
+
+            try:
+                setup_tensorrt_engines(policy, config.trt_engine_path, mode=config.trt_mode)
+            except BaseException:
+                close_tensorrt_engines(policy)
+                raise
+            engine_cleanup = closing_tensorrt_engines(policy)
+
+        if config.warmup:
+            t0 = time.monotonic()
+            policy.warmup(image_size=config.warmup_image_size)
+            print(f"  Warmup completed in {(time.monotonic() - t0) * 1000:.1f} ms")
     elif config.dataset_path is not None:
         if config.execution_horizon is None:
             raise ValueError(
@@ -164,15 +219,17 @@ def main(config: ServerConfig):
 
         policy = Gr00tSimPolicyWrapper(policy)
 
-    with PolicyServer(
-        policy=policy,
-        host=config.host,
-        port=config.port,
-    ) as server:
-        try:
-            server.run()
-        except KeyboardInterrupt:
-            print("\nShutting down server...")
+    with engine_cleanup:
+        with PolicyServer(
+            policy=policy,
+            host=config.host,
+            port=config.port,
+            api_token=config.api_token,
+        ) as server:
+            try:
+                server.run()
+            except KeyboardInterrupt:
+                print("\nShutting down server...")
 
 
 if __name__ == "__main__":

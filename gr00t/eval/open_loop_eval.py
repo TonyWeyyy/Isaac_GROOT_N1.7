@@ -169,7 +169,9 @@ def evaluate_single_trajectory(
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
     for step_count in range(0, actual_steps, execution_horizon):
-        data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
+        data_point = extract_step_data(
+            traj, step_count, modality_configs, embodiment_tag, allow_padding=True
+        )
         logging.info(f"inferencing at step: {step_count}")
         obs = {}
         for k, v in data_point.states.items():

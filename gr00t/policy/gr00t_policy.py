@@ -377,6 +377,48 @@ class Gr00tPolicy(BasePolicy):
                     f"Language batch item must be a string. Got {type(batch_item[0])}"
                 )
 
+    def _prepare_rtc_inputs(
+        self,
+        collated_inputs: dict[str, Any],
+        states: list[dict[str, np.ndarray]],
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Encode physical ``prev_action`` into normalized model-space RTC inputs."""
+        if "prev_action" not in options:
+            return options
+
+        prev_action = options["prev_action"]
+        action_keys = self.modality_configs["action"].modality_keys
+        action_horizon = len(self.modality_configs["action"].delta_indices)
+        max_action_dim = self.processor.max_action_dim
+        max_action_horizon = self.processor.max_action_horizon
+
+        encoded_batch = []
+        for batch_idx, state_b in enumerate(states):
+            prev_b = {
+                k: np.asarray(prev_action[k][batch_idx], dtype=np.float32) for k in action_keys
+            }
+            norm_b = self.processor.state_action_processor.apply_action(
+                prev_b, self.embodiment_tag.value, state=state_b
+            )
+            cat_b = torch.cat([torch.from_numpy(norm_b[k]) for k in action_keys], dim=-1)
+            if cat_b.shape[1] < max_action_dim:
+                cat_b = torch.cat(
+                    [cat_b, torch.zeros(cat_b.shape[0], max_action_dim - cat_b.shape[1])], dim=-1
+                )
+            if cat_b.shape[0] < max_action_horizon:
+                cat_b = torch.cat(
+                    [cat_b, torch.zeros(max_action_horizon - cat_b.shape[0], max_action_dim)], dim=0
+                )
+            encoded_batch.append(cat_b)
+
+        collated_inputs["inputs"]["action"] = torch.stack(encoded_batch, dim=0).to(
+            dtype=torch.bfloat16
+        )
+        model_options = {k: v for k, v in options.items() if k != "prev_action"}
+        model_options.setdefault("action_horizon", action_horizon)
+        return model_options
+
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -386,12 +428,12 @@ class Gr00tPolicy(BasePolicy):
         1. Unbatch observations into individual samples
         2. Convert each to VLAStepData and process
         3. Collate into model input batch
-        4. Run model inference
+        4. Run model inference (with optional RTC options)
         5. Decode and unnormalize actions
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional parameters (e.g. RTC inpainting configuration)
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -412,9 +454,18 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
+        model_options = (
+            self._prepare_rtc_inputs(collated_inputs, states, options)
+            if options is not None
+            else None
+        )
+
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            if model_options is not None:
+                model_pred = self.model.get_action(**collated_inputs, options=model_options)
+            else:
+                model_pred = self.model.get_action(**collated_inputs)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -430,6 +481,33 @@ class Gr00tPolicy(BasePolicy):
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
         return casted_action, {}
+
+    def warmup(self, image_size: tuple[int, int] = (256, 256)) -> None:
+        """Run one dummy inference pass to warm up CUDA/cuDNN/TRT/FlashAttention kernels."""
+        height, width = image_size
+        video_horizon = len(self.modality_configs["video"].delta_indices)
+        state_horizon = len(self.modality_configs["state"].delta_indices)
+        norm_params = self.processor.state_action_processor.norm_params[self.embodiment_tag.value]
+
+        dummy_obs: dict[str, Any] = {
+            "video": {
+                k: np.zeros((1, video_horizon, height, width, 3), dtype=np.uint8)
+                for k in self.modality_configs["video"].modality_keys
+            },
+            "state": {
+                k: np.zeros(
+                    (1, state_horizon, int(norm_params["state"][k]["dim"].item())),
+                    dtype=np.float32,
+                )
+                for k in self.modality_configs["state"].modality_keys
+            },
+            "language": {
+                k: [["warmup"]] for k in self.modality_configs["language"].modality_keys
+            },
+        }
+        self.get_action(dummy_obs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

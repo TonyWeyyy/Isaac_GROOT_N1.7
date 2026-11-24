@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -61,9 +62,30 @@ def _get_video_decoder_cls():
     return VideoDecoder
 
 
+def _resolve_default_ffmpeg_threads() -> int:
+    """Choose a safe FFmpeg thread count that avoids worker thread oversubscription."""
+    env_override = os.environ.get("GR00T_FFMPEG_THREADS")
+    if env_override is not None:
+        return int(env_override)
+    try:
+        from torch.utils.data import get_worker_info
+
+        if get_worker_info() is not None:
+            # Inside a DataLoader worker process, cap FFmpeg threads to 1 so
+            # num_workers × nproc threads do not thrash CPU cores or deadlock after fork.
+            return 1
+    except Exception:
+        pass
+    return _DEFAULT_DECODER_KWARGS["num_ffmpeg_threads"]
+
+
 def _build_decoder(video_path: str, decoder_kwargs: Optional[dict]):
     video_decoder_cls = _get_video_decoder_cls()
-    kwargs = {**_DEFAULT_DECODER_KWARGS, **(decoder_kwargs or {})}
+    kwargs = {
+        **_DEFAULT_DECODER_KWARGS,
+        "num_ffmpeg_threads": _resolve_default_ffmpeg_threads(),
+        **(decoder_kwargs or {}),
+    }
     return video_decoder_cls(video_path, **kwargs)
 
 

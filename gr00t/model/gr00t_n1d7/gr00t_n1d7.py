@@ -209,12 +209,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
 
-        # Handle state history
+        # Handle state history (avoid mutating caller's action_input in place)
         assert action_input.state.shape[1] == self.config.state_history_length
-        action_input.state = action_input.state.view(action_input.state.shape[0], 1, -1)
+        state = action_input.state.view(action_input.state.shape[0], 1, -1)
 
         # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
+        state_features = self.state_encoder(state, embodiment_id)
 
         # Dropout state features (training only): zero out dropped states.
         if self.training and self.state_dropout_prob > 0:
@@ -251,22 +251,22 @@ class Gr00tN1d7ActionHead(nn.Module):
         if self.config.use_alternate_vl_dit:
             image_mask = backbone_output.image_mask
             backbone_attention_mask = backbone_output.backbone_attention_mask
-            model_output, _ = self.model(
+            model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
                 timestep=t_discretized,
-                return_all_hidden_states=True,
+                return_all_hidden_states=False,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
             )
         else:
-            model_output, _ = self.model(
+            model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
                 timestep=t_discretized,
-                return_all_hidden_states=True,
+                return_all_hidden_states=False,
             )
 
         pred = self.action_decoder(model_output, embodiment_id)
@@ -369,29 +369,44 @@ class Gr00tN1d7ActionHead(nn.Module):
 
             action_horizon_before_padding = options["action_horizon"]
 
+            rtc_overlap_steps = options["rtc_overlap_steps"]
+            rtc_frozen_steps = options["rtc_frozen_steps"]
+            if rtc_frozen_steps < 0 or rtc_overlap_steps < rtc_frozen_steps:
+                raise ValueError(
+                    f"Invalid RTC schedule: rtc_frozen_steps={rtc_frozen_steps}, "
+                    f"rtc_overlap_steps={rtc_overlap_steps}"
+                )
+            if rtc_overlap_steps > action_horizon_before_padding:
+                raise ValueError(
+                    f"rtc_overlap_steps ({rtc_overlap_steps}) exceeds "
+                    f"action_horizon ({action_horizon_before_padding})"
+                )
+
             # Use previous action instead of pure noise to do inpainting
-            actions[:, : options["rtc_overlap_steps"], :] = action_input["action"][
+            actions[:, :rtc_overlap_steps, :] = action_input["action"][
                 :,
-                action_horizon_before_padding
-                - options["rtc_overlap_steps"] : action_horizon_before_padding,
+                action_horizon_before_padding - rtc_overlap_steps : action_horizon_before_padding,
                 :,
-            ]
-            vel_strength[:, : options["rtc_frozen_steps"], :] = 0.0
+            ].to(device=device, dtype=actions.dtype)
+            vel_strength[:, :rtc_frozen_steps, :] = 0.0
             # NOTE: use an exponential ramp strength to set the remaining unfrozen rtc_steps
-            intermediate_steps = options["rtc_overlap_steps"] - options["rtc_frozen_steps"]
-            # Create exponential ramp from 0 to 1 over intermediate steps
-            t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
-            ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
-            ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
-            ramp = ramp[
-                1:-1
-            ]  # we will only take the middle part of the ramp, ignore the 0.0 and 1.0
-            # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
-            vel_strength[
-                :,
-                options["rtc_frozen_steps"] : options["rtc_overlap_steps"],
-                :,
-            ] = ramp[None, :, None].to(device)
+            intermediate_steps = rtc_overlap_steps - rtc_frozen_steps
+            if intermediate_steps > 0:
+                # Create exponential ramp from 0 to 1 over intermediate steps
+                t_ramp = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
+                ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t_ramp)
+                ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
+                ramp = ramp[1:-1]  # take the middle part of the ramp, ignore 0.0 and 1.0
+                # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
+                vel_strength[:, rtc_frozen_steps:rtc_overlap_steps, :] = ramp[None, :, None].to(
+                    device=device, dtype=vel_strength.dtype
+                )
+
+        # Precompute action position embeddings once outside the denoising loop.
+        pos_embs = None
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(self.config.action_horizon, dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
 
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
@@ -400,13 +415,11 @@ class Gr00tN1d7ActionHead(nn.Module):
 
             # Embed noised action trajectory.
             timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
+                size=(batch_size,), fill_value=t_discretized, dtype=torch.long, device=device
             )
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
             # Add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            if pos_embs is not None:
                 action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.
@@ -482,9 +495,12 @@ class Gr00tN1d7ActionHead(nn.Module):
     def dtype(self):
         return next(iter(self.parameters())).dtype
 
+    _INPUT_KEYS = ("state", "action", "action_mask", "embodiment_id")
+
     def prepare_input(self, batch: dict) -> BatchFeature:
         """Prepare input batch for the action head."""
-        return BatchFeature(data=batch)
+        filtered = {k: batch[k] for k in self._INPUT_KEYS if k in batch}
+        return BatchFeature(data=filtered if filtered else batch)
 
 
 def get_backbone_cls(config: Gr00tN1d7Config):
@@ -506,7 +522,7 @@ class Gr00tN1d7(PreTrainedModel):
     def __init__(
         self,
         config: Gr00tN1d7Config,
-        transformers_loading_kwargs: dict = {"trust_remote_code": True},
+        transformers_loading_kwargs: dict | None = None,
     ):
         """
         Initialize Gr00tN1d7 model.
@@ -525,6 +541,11 @@ class Gr00tN1d7(PreTrainedModel):
         """
         super().__init__(config)
         self.config = config
+        self._transformers_loading_kwargs = (
+            dict(transformers_loading_kwargs)
+            if transformers_loading_kwargs is not None
+            else {"trust_remote_code": True}
+        )
 
         backbone_cls = get_backbone_cls(config)
         self.backbone = backbone_cls(
@@ -537,18 +558,30 @@ class Gr00tN1d7(PreTrainedModel):
             load_bf16=config.load_bf16,
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,
-            transformers_loading_kwargs=transformers_loading_kwargs,
+            transformers_loading_kwargs=self._transformers_loading_kwargs,
         )
 
         # Initialize action head
         self.action_head = Gr00tN1d7ActionHead(config)
-        from .processing_gr00t_n1d7 import Gr00tN1d7DataCollator
+        # Lazy-initialized collator: avoids a duplicate Qwen3VLProcessor.from_pretrained()
+        # call when training / Gr00tPolicy already owns a Gr00tN1d7Processor.
+        self._collator = None
 
-        self.collator = Gr00tN1d7DataCollator(
-            model_name=config.model_name,
-            model_type=config.backbone_model_type,
-            transformers_loading_kwargs=transformers_loading_kwargs,
-        )
+    @property
+    def collator(self):
+        if self._collator is None:
+            from .processing_gr00t_n1d7 import Gr00tN1d7DataCollator
+
+            self._collator = Gr00tN1d7DataCollator(
+                model_name=self.config.model_name,
+                model_type=self.config.backbone_model_type,
+                transformers_loading_kwargs=self._transformers_loading_kwargs,
+            )
+        return self._collator
+
+    @collator.setter
+    def collator(self, value):
+        self._collator = value
 
     def prepare_input(self, inputs: dict) -> Tuple[BatchFeature, BatchFeature]:
         """Prepare inputs for backbone and action head."""
@@ -567,18 +600,22 @@ class Gr00tN1d7(PreTrainedModel):
             inputs.pop("vlm_content")
             inputs.update(prep)
 
-        backbone_inputs = self.backbone.prepare_input(inputs)
-        action_inputs = self.action_head.prepare_input(inputs)
+        # Move each tensor to device/dtype ONCE before splitting between backbone and action head,
+        # avoiding duplicate H2D transfers of large vision tensors (e.g. pixel_values).
+        target_device = self.device
+        target_dtype = self.dtype
+        non_blocking = target_device.type == "cuda"
 
-        # Move to device and dtype
         def to_device_with_dtype(x):
+            if not isinstance(x, torch.Tensor):
+                return x
             if torch.is_floating_point(x):
-                return x.to(self.device, dtype=self.dtype)
-            else:
-                return x.to(self.device)
+                return x.to(target_device, dtype=target_dtype, non_blocking=non_blocking)
+            return x.to(target_device, non_blocking=non_blocking)
 
-        backbone_inputs = tree.map_structure(to_device_with_dtype, backbone_inputs)
-        action_inputs = tree.map_structure(to_device_with_dtype, action_inputs)
+        inputs_on_device = tree.map_structure(to_device_with_dtype, inputs)
+        backbone_inputs = self.backbone.prepare_input(inputs_on_device)
+        action_inputs = self.action_head.prepare_input(inputs_on_device)
 
         return backbone_inputs, action_inputs
 

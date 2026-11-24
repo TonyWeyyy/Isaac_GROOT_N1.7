@@ -31,12 +31,11 @@ if __name__ == "__main__":
     config = tyro.cli(Config, default=get_default_config(), description=__doc__)
     # Load config from path if provided
     if config.load_config_path:
-        assert Path(config.load_config_path).exists(), (
-            f"Config path does not exist: {config.load_config_path}"
-        )
-        config = config.load(Path(config.load_config_path))  # inplace loading
+        loaded_config_path = config.load_config_path
+        assert Path(loaded_config_path).exists(), f"Config path does not exist: {loaded_config_path}"
+        config = config.load(Path(loaded_config_path))  # inplace loading
         config.load_config_path = None
-        logging.info(f"Loaded config from {config.load_config_path}")
+        logging.info(f"Loaded config from {loaded_config_path}")
 
         # Override with command-line.
         config = tyro.cli(Config, default=config, description=__doc__)

@@ -77,6 +77,7 @@ if __name__ == "__main__":
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
+    config.model.tune_top_llm_layers = ft_config.tune_top_llm_layers
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.state_dropout_prob = ft_config.state_dropout_prob
@@ -101,9 +102,16 @@ if __name__ == "__main__":
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 
+    import torch
+
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
-    config.training.optim = "adamw_torch"
+    config.training.optim = (
+        ft_config.optim
+        if (ft_config.optim != "adamw_torch_fused" or torch.cuda.is_available())
+        else "adamw_torch"
+    )
+    config.training.gradient_checkpointing = ft_config.gradient_checkpointing
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate

@@ -280,8 +280,8 @@ class Gr00tTrainer(Trainer):
         # torch.save(input_embeddings, f"input_embeddings_{self.state.global_step}.pt")
         # torch.save(output_embeddings, f"output_embeddings_{self.state.global_step}.pt")
 
-        # Record last loss for testing purposes.
-        self.loss = loss
+        # Record last loss for testing purposes (detached so autograd metadata is not retained).
+        self.loss = loss.detach()
 
         # --------------------------------------------------------------
         # Accuracy calculation

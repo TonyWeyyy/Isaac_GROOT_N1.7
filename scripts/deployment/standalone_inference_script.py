@@ -335,7 +335,9 @@ def prepare_observation_data(
         Parsed observation ready for inference
     """
     # Extract step data from trajectory
-    data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
+    data_point = extract_step_data(
+        traj, step_count, modality_configs, embodiment_tag, allow_padding=True
+    )
 
     # Build observation dictionary
     obs = {}

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+from functools import lru_cache
 import os
 from typing import Optional
 
@@ -26,6 +27,7 @@ from torch import nn
 import torch.nn.functional as F
 
 
+@lru_cache(maxsize=1)
 def _is_spark_sm121() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -304,7 +306,13 @@ class DiT(ModelMixin, ConfigMixin):
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
 
-        all_hidden_states = [hidden_states]
+        # Normalize integer/bool encoder masks to bool for diffusers Attention.
+        if encoder_attention_mask is not None and not torch.is_floating_point(
+            encoder_attention_mask
+        ):
+            encoder_attention_mask = encoder_attention_mask.bool()
+
+        all_hidden_states = [hidden_states] if return_all_hidden_states else None
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
@@ -321,10 +329,11 @@ class DiT(ModelMixin, ConfigMixin):
                     hidden_states,
                     attention_mask=None,
                     encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=None,
+                    encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
                 )
-            all_hidden_states.append(hidden_states)
+            if all_hidden_states is not None:
+                all_hidden_states.append(hidden_states)
 
         # Output processing
         conditioning = temb
@@ -355,9 +364,9 @@ class AlternateVLDiT(DiT):
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
+        image_attention_mask: Optional[torch.Tensor] = None,
+        non_image_attention_mask: Optional[torch.Tensor] = None,
     ):
-        assert image_mask is not None, "Image mask is required"
-
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
 
@@ -365,14 +374,14 @@ class AlternateVLDiT(DiT):
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
 
-        # Create attention masks for image and non-image tokens
-        # image_mask shape: (B, S) where True indicates image tokens
-        # For attention, we need to invert: False means "don't attend to this token"
+        # Create attention masks for image and non-image tokens unless precomputed
+        # by the caller (e.g., hoisted outside the inference denoising loop).
+        if image_attention_mask is None or non_image_attention_mask is None:
+            assert image_mask is not None, "Image mask is required"
+            image_attention_mask = image_mask & backbone_attention_mask
+            non_image_attention_mask = (~image_mask) & backbone_attention_mask
 
-        image_attention_mask = image_mask & backbone_attention_mask
-        non_image_attention_mask = (~image_mask) & backbone_attention_mask
-
-        all_hidden_states = [hidden_states]
+        all_hidden_states = [hidden_states] if return_all_hidden_states else None
         assert self.config.interleave_self_attention, "Interleave self attention must be enabled"
 
         # Process through transformer blocks
@@ -402,7 +411,8 @@ class AlternateVLDiT(DiT):
                     encoder_attention_mask=curr_encoder_attention_mask,
                     temb=temb,
                 )
-            all_hidden_states.append(hidden_states)
+            if all_hidden_states is not None:
+                all_hidden_states.append(hidden_states)
 
         # Output processing
         conditioning = temb

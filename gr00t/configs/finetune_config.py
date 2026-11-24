@@ -58,6 +58,9 @@ class FinetuneConfig:
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
+    tune_top_llm_layers: int = 0
+    """Number of top LLM layers to unfreeze when tune_llm is False."""
+
     state_dropout_prob: float = 0.2
     """
     Dropout probability applied to state inputs for regularization during training.
@@ -130,6 +133,12 @@ class FinetuneConfig:
 
     learning_rate: float = 1e-4
     """Initial learning rate for optimizer."""
+
+    optim: str = "adamw_torch_fused"
+    """Optimizer name passed to HuggingFace TrainingArguments (e.g. adamw_torch_fused, adamw_torch)."""
+
+    gradient_checkpointing: bool = False
+    """If True, enable gradient checkpointing to reduce training VRAM usage."""
 
     gradient_accumulation_steps: int = 1
     """Forward passes per optimizer step. Multiplies ``global_batch_size`` to

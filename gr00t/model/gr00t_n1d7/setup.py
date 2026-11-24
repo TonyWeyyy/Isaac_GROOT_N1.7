@@ -83,6 +83,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
                 tune_visual=self.config.model.tune_visual,
+                tune_top_llm_layers=self.config.model.tune_top_llm_layers,
                 tune_projector=self.config.model.tune_projector,
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
@@ -96,11 +97,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             missing_keys = loading_info.get("missing_keys", [])
             mask_token_missing = any("mask_token" in key for key in missing_keys)
-            if mask_token_missing and model.action_head.mask_token is not None:
+            mask_token = getattr(model.action_head, "mask_token", None)
+            if mask_token_missing and mask_token is not None:
                 with torch.no_grad():
-                    model.action_head.mask_token.data.copy_(
-                        0.02 * torch.randn_like(model.action_head.mask_token)
-                    )
+                    mask_token.data.copy_(0.02 * torch.randn_like(mask_token))
                 logging.info("mask_token not in checkpoint - initialized")
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
@@ -174,11 +174,12 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 crop_fraction=self.model_config.crop_fraction,
                 letter_box_transform=letter_box_transform,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
-                use_alternate_vl_dit=self.model_config.use_alternate_vl_dit,
                 use_relative_action=self.model_config.use_relative_action,
-                # State augmentation overrides
+                # State augmentation overrides: Gr00tN1d7ActionHead already applies
+                # state_dropout_prob cleanly on state_features; setting 0.0 here avoids
+                # double-dropping state (which turned p into 1-(1-p)^2 and leaked MLP bias).
                 exclude_state=self.model_config.exclude_state,
-                state_dropout_prob=self.model_config.state_dropout_prob,
+                state_dropout_prob=0.0,
                 use_mean_std=self.model_config.use_mean_std,
                 **self.transformers_loading_kwargs,
             )
@@ -205,9 +206,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 crop_fraction=self.model_config.crop_fraction,
                 letter_box_transform=letter_box_transform,
                 use_relative_action=self.model_config.use_relative_action,
-                # State augmentation
+                # State augmentation: handled once in Gr00tN1d7ActionHead.forward().
                 exclude_state=self.model_config.exclude_state,
-                state_dropout_prob=self.model_config.state_dropout_prob,
+                state_dropout_prob=0.0,
                 use_mean_std=self.model_config.use_mean_std,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )

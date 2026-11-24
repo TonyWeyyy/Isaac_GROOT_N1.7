@@ -120,7 +120,7 @@ def merge_statistics(
 
         # Compute final combined statistics
         overall_mean = weighted_means.tolist()
-        overall_variance = weighted_squares - weighted_means**2
+        overall_variance = np.maximum(weighted_squares - weighted_means**2, 0.0)
         overall_std = np.sqrt(overall_variance).tolist()
 
         # Global min/max across all datasets
@@ -420,35 +420,60 @@ class ShardedMixtureDataset(IterableDataset):
         # Initialize worker-specific shard schedule
         self.worker_shard_sampling_schedule = self.filter_shard_sample_schedule()
         self.curr_shard_index = -1
+        if not self.worker_shard_sampling_schedule:
+            self.close()
+            return
         self.cache_next_shard()
         rng = np.random.default_rng(self.seed + self.epoch)
 
-        # Continuous iteration with epoch management
-        while True:
-            self.curr_shard_index += 1
+        try:
+            # Continuous iteration in training mode; single pass in eval mode
+            while True:
+                self.curr_shard_index += 1
 
-            # Wait for background caching to complete
-            wait_start = time.time()
-            self.finish_cache_shard()
-            wait_end = time.time()
+                # Wait for background caching to complete
+                wait_start = time.time()
+                self.finish_cache_shard()
+                wait_end = time.time()
 
-            dataset_index, shard_index = self.worker_shard_sampling_schedule[self.curr_shard_index]
-            print(
-                f"Rank {self.rank}, Worker {self.worker_id}: Wait for shard {shard_index} in dataset {dataset_index} in {wait_end - wait_start:.2f} seconds"
-            )
+                dataset_index, shard_index = self.worker_shard_sampling_schedule[
+                    self.curr_shard_index
+                ]
+                print(
+                    f"Rank {self.rank}, Worker {self.worker_id}: Wait for shard {shard_index} in dataset {dataset_index} in {wait_end - wait_start:.2f} seconds"
+                )
 
-            # Start caching next shard immediately
-            self.cache_next_shard()
+                has_more_shards = (
+                    self.training
+                    or self.curr_shard_index + 1 < len(self.worker_shard_sampling_schedule)
+                )
+                if has_more_shards:
+                    # Start caching next shard immediately
+                    self.cache_next_shard()
 
-            # Yield shuffled timesteps from current shard
-            assert self.curr_shard is not None
-            indices_in_shard = np.arange(len(self.curr_shard))
-            rng.shuffle(indices_in_shard)
-            for index in indices_in_shard:
-                yield self.curr_shard[index]
+                # Yield shuffled timesteps from current shard
+                assert self.curr_shard is not None
+                indices_in_shard = np.arange(len(self.curr_shard))
+                rng.shuffle(indices_in_shard)
+                for index in indices_in_shard:
+                    yield self.curr_shard[index]
 
-            # Clean up cached shard to free memory
-            self.delete_cached_shard()
+                # Clean up cached shard to free memory
+                self.delete_cached_shard()
+
+                if not has_more_shards:
+                    break
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Release background prefetch executor and cached shard references."""
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+        self._cache_job = None
+        self.curr_shard = None
 
     def cache_next_shard(self):
         """

@@ -161,10 +161,14 @@ class Gr00tN1d7DataCollator:
         self,
         model_name: str,
         model_type: str = "qwen",
-        transformers_loading_kwargs: dict = {},
+        transformers_loading_kwargs: dict | None = None,
+        processor=None,
     ):
         ### We need to use the same processor for padding input ids and concat
-        self.processor = build_processor(model_name, transformers_loading_kwargs)
+        if processor is not None:
+            self.processor = processor
+        else:
+            self.processor = build_processor(model_name, dict(transformers_loading_kwargs or {}))
         # Set padding side to 'left' for Flash Attention compatibility
         self.processor.tokenizer.padding_side = "left"
         self.model_type = model_type
@@ -237,7 +241,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         extra_augmentation_config: dict | None = None,
         use_relative_action: bool = False,
         embodiment_id_mapping: dict[str, int] | None = None,
-        transformers_loading_kwargs: dict = {"trust_remote_code": True},
+        transformers_loading_kwargs: dict | None = None,
         # State augmentation
         exclude_state: bool = False,
         state_dropout_prob: float = 0.0,
@@ -245,6 +249,11 @@ class Gr00tN1d7Processor(BaseProcessor):
         use_mean_std: bool = False,
         letter_box_transform: bool = False,
     ):
+        transformers_loading_kwargs = (
+            dict(transformers_loading_kwargs)
+            if transformers_loading_kwargs is not None
+            else {"trust_remote_code": True}
+        )
         self.modality_configs = parse_modality_configs(modality_configs)
 
         # Initialize StateActionProcessor for state/action normalization
@@ -255,6 +264,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             clip_outliers=clip_outliers,
             apply_sincos_state_encoding=apply_sincos_state_encoding,
             use_relative_action=use_relative_action,
+            use_mean_std=use_mean_std,
         )
 
         # Save state action processor settings
@@ -289,7 +299,11 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.processor = build_processor(model_name, transformers_loading_kwargs)
         # Set padding side to 'left' for Flash Attention compatibility
         self.processor.tokenizer.padding_side = "left"
-        self.embodiment_id_mapping = embodiment_id_mapping or EMBODIMENT_TAG_TO_PROJECTOR_INDEX
+        self.embodiment_id_mapping = dict(
+            embodiment_id_mapping
+            if embodiment_id_mapping is not None
+            else EMBODIMENT_TAG_TO_PROJECTOR_INDEX
+        )
         # Merge any missing pre-trained embodiment tags into the custom mapping
         for k, v in EMBODIMENT_TAG_TO_PROJECTOR_INDEX.items():
             if k not in self.embodiment_id_mapping:
@@ -327,6 +341,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             model_name=model_name,
             model_type=model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            processor=self.processor,
         )
         self.train()
 
@@ -474,8 +489,8 @@ class Gr00tN1d7Processor(BaseProcessor):
                 [torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1
             )
 
-        assert normalized_states.shape[1] <= self.max_state_dim, (
-            f"State dimension {normalized_states.shape[1]} exceeds max_state_dim {self.max_state_dim}"
+        assert normalized_states.shape[-1] <= self.max_state_dim, (
+            f"State dimension {normalized_states.shape[-1]} exceeds max_state_dim {self.max_state_dim}"
         )
         padding_shape = (
             *normalized_states.shape[:-1],
@@ -486,26 +501,31 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         # Process images: observation values are (B, T, H, W, C) numpy arrays
         image_keys = modality_config["video"].modality_keys
-        images_dict = {view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys}
-        images = torch.stack(
-            [images_dict[view] for view in image_keys], dim=2
-        )  # (B, T, V, H, W, C)
-        assert images.ndim == 6
-        B, T, V, img_H, img_W, img_C = images.shape
-
         if self.use_albumentations:
-            images_flat = images.reshape(B * T * V, img_H, img_W, img_C)
-            pil_images = [Image.fromarray(img.numpy()) for img in images_flat]
-            transformed_pil, _ = apply_with_replay(self.eval_image_transform, pil_images)
-            transformed_stacked = torch.stack(transformed_pil)  # (B*T*V, C, H_new, W_new)
+            images_np = np.stack(
+                [np.asarray(observation[f"video.{view}"]) for view in image_keys], axis=2
+            )  # (B, T, V, H, W, C)
+            assert images_np.ndim == 6
+            B, T, V, img_H, img_W, img_C = images_np.shape
+            images_flat = images_np.reshape(B * T * V, img_H, img_W, img_C)
+            transformed_tensors, _ = apply_with_replay(self.eval_image_transform, list(images_flat))
+            transformed_stacked = torch.stack(transformed_tensors)  # (B*T*V, C, H_new, W_new)
             _, img_C_new, img_H_new, img_W_new = transformed_stacked.shape
             transformed_images = transformed_stacked.reshape(
                 B, T * V, img_C_new, img_H_new, img_W_new
-            ).numpy()
+            )
         else:
+            images_dict = {
+                view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys
+            }
+            images = torch.stack(
+                [images_dict[view] for view in image_keys], dim=2
+            )  # (B, T, V, H, W, C)
+            assert images.ndim == 6
+            B, T, V, img_H, img_W, img_C = images.shape
             # Rearrange (B, T, V, H, W, C) → (B, T*V, C, H, W) for torchvision
             images_perm = images.permute(0, 1, 2, 5, 3, 4).reshape(B, T * V, img_C, img_H, img_W)
-            transformed_images = self.eval_image_transform(images_perm).numpy()
+            transformed_images = self.eval_image_transform(images_perm)
 
         language_key = modality_config["language"].modality_keys[0]
         language = [
@@ -872,17 +892,42 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "exclude_state",
                 "state_dropout_prob",
                 "use_mean_std",
+                "use_percentiles",
+                "clip_outliers",
+                "formalize_language",
+                "apply_sincos_state_encoding",
+                "use_albumentations",
+                "extra_augmentation_config",
+                "letter_box_transform",
+                "shortest_image_edge",
+                "crop_fraction",
+                "image_crop_size",
+                "image_target_size",
                 "model_name",
                 "model_type",
                 "max_action_horizon",
                 "max_state_dim",
                 "max_action_dim",
             ]
+            # If caller explicitly switches to shortest_image_edge/crop_fraction
+            # with image_crop_size=None / image_target_size=None, honor clearing the
+            # legacy size fields so fractional cropping takes effect.
+            switching_to_fractional = (
+                kwargs.get("shortest_image_edge") is not None
+                and kwargs.get("crop_fraction") is not None
+            )
             for key in override_keys:
                 if key in kwargs:
                     override = kwargs.pop(key)
-                    if override is not None:
+                    if override is not None or (
+                        switching_to_fractional and key in ("image_crop_size", "image_target_size")
+                    ):
                         processor_kwargs[key] = override
+            if kwargs:
+                logger.warning(
+                    "Ignoring unrecognized Gr00tN1d7Processor.from_pretrained override(s): %s",
+                    sorted(kwargs.keys()),
+                )
         return cls(**processor_kwargs, transformers_loading_kwargs=transformers_loading_kwargs)
 
 

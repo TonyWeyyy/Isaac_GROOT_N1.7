@@ -145,7 +145,7 @@ class Qwen3Backbone(torch.nn.Module):
         load_bf16: bool = False,
         tune_top_llm_layers: int = 0,
         trainable_params_fp32: bool = False,
-        transformers_loading_kwargs: dict = {},
+        transformers_loading_kwargs: dict | None = None,
     ):
         """
         Qwen3Backbone is to generate n_queries to represent the future action hidden states.
@@ -162,6 +162,7 @@ class Qwen3Backbone(torch.nn.Module):
             )
 
         super().__init__()
+        transformers_loading_kwargs = dict(transformers_loading_kwargs or {})
 
         # Add attention kwargs
         extra_kwargs = {}
@@ -249,10 +250,13 @@ class Qwen3Backbone(torch.nn.Module):
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int):
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
+        self.tune_top_llm_layers = tune_top_llm_layers
         for p in self.parameters():
             p.requires_grad = True
         if not tune_llm:
             self.model.language_model.requires_grad_(False)
+            if hasattr(self.model, "lm_head"):
+                self.model.lm_head.requires_grad_(False)
         if not tune_visual:
             self.model.visual.requires_grad_(False)
 
@@ -279,6 +283,9 @@ class Qwen3Backbone(torch.nn.Module):
         if self.training:
             if self.model.language_model and not self.tune_llm:
                 self.model.language_model.eval()
+                if self.tune_top_llm_layers > 0:
+                    for layer in self.model.language_model.layers[-self.tune_top_llm_layers :]:
+                        layer.train()
             if self.model.visual and not self.tune_visual:
                 self.model.visual.eval()
 
@@ -351,18 +358,27 @@ class Qwen3Backbone(torch.nn.Module):
             )
         return changed
 
+    _INPUT_KEYS = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
+
     def prepare_input(self, batch: dict) -> BatchFeature:
-        return BatchFeature(data=batch)
+        filtered = {k: batch[k] for k in self._INPUT_KEYS if k in batch}
+        return BatchFeature(data=filtered if filtered else batch)
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
-        # 0. Set frozen module to eval
-        keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
-        vl_input = {k: vl_input[k] for k in keys_to_use}
-        outputs = self.model(**vl_input, output_hidden_states=True)
+        # Pass logits_to_keep=slice(0, 0) and use_cache=False so Qwen3VL skips both the
+        # unused [B, S, 151936] lm_head projection and KV-cache allocation while preserving
+        # bitwise-identical pre-RMSNorm hidden_states[-1] expected by pretrained N1.7 weights.
+        vl_kwargs = {k: vl_input[k] for k in self._INPUT_KEYS}
+        outputs = self.model(
+            **vl_kwargs,
+            output_hidden_states=True,
+            use_cache=False,
+            logits_to_keep=slice(0, 0),
+        )
         outputs = outputs.hidden_states[-1]
-        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
-        attention_mask = vl_input["attention_mask"] == 1
+        image_mask = vl_kwargs["input_ids"] == self.model.config.image_token_id
+        attention_mask = vl_kwargs["attention_mask"] == 1
         return BatchFeature(
             data={
                 "backbone_features": outputs,

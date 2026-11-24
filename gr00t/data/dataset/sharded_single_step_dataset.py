@@ -38,8 +38,14 @@ def extract_step_data(
         step_data[modality] = {}
         # Sample timesteps according to delta indices configuration
         indices_to_load = [step_index + delta_index for delta_index in config.delta_indices]
+        ep_len = len(episode_data)
         if allow_padding:
-            indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
+            indices_to_load = [max(0, min(idx, ep_len - 1)) for idx in indices_to_load]
+        elif any(idx < 0 or idx >= ep_len for idx in indices_to_load):
+            raise IndexError(
+                f"Timestep indices {indices_to_load} out of bounds for episode of length {ep_len} "
+                f"(modality={modality!r}, step_index={step_index}, allow_padding=False)."
+            )
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
@@ -148,6 +154,13 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
         self.action_horizon = max(action_delta_indices) - min(action_delta_indices) + 1
+        all_deltas = [
+            delta
+            for cfg in modality_configs.values()
+            if getattr(cfg, "delta_indices", None)
+            for delta in cfg.delta_indices
+        ]
+        self.min_step_index = 0 if allow_padding else max(0, -min(all_deltas, default=0))
 
         self.episode_loader = LeRobotEpisodeLoader(
             dataset_path=dataset_path,
@@ -184,7 +197,10 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_splits = []
         total_steps = 0
         for ep_idx in shuffled_episode_indices:
-            step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
+            effective_len = self.get_effective_episode_length(ep_idx)
+            if effective_len <= self.min_step_index:
+                continue
+            step_indices = np.arange(self.min_step_index, effective_len)
             self.rng.shuffle(step_indices)
             total_steps += len(step_indices)
             for i in range(num_splits):
@@ -287,9 +303,32 @@ class ShardedSingleStepDataset(ShardedDataset):
         """
         episodes = self.sharded_episodes[idx]
         datapoints = []
+        has_subset_loader = hasattr(self.episode_loader, "load_episode")
+        frame_deltas: list[int] = []
+        for mod in ("video", "mask"):
+            if mod in self.modality_configs:
+                frame_deltas.extend(self.modality_configs[mod].delta_indices)
+        unique_frame_deltas = sorted(set(frame_deltas))
+
         for ep_idx, step_indices in episodes:
-            # Load episode data once per episode in shard
-            episode_data = self.episode_loader[ep_idx]
+            # Decode only the exact video/mask frames needed by this shard's step_indices
+            # instead of decoding 100% of every episode on every shard.
+            if has_subset_loader and unique_frame_deltas:
+                ep_len = self.episode_loader.get_episode_length(ep_idx)
+                needed_frames: set[int] = set()
+                for step_index in step_indices:
+                    base = int(step_index)
+                    for delta in unique_frame_deltas:
+                        frame_idx = base + delta
+                        if self.allow_padding:
+                            frame_idx = max(0, min(frame_idx, ep_len - 1))
+                        if 0 <= frame_idx < ep_len:
+                            needed_frames.add(frame_idx)
+                episode_data = self.episode_loader.load_episode(
+                    ep_idx, video_indices=sorted(needed_frames)
+                )
+            else:
+                episode_data = self.episode_loader[ep_idx]
             for step_index in step_indices:
                 datapoints.append(self.get_datapoint(episode_data, step_index))
         return datapoints

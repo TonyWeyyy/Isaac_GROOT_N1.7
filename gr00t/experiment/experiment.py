@@ -19,6 +19,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import warnings
 
 from omegaconf import OmegaConf
@@ -366,8 +367,16 @@ def run(config: Config):
     else:
         trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
 
-    # Save final model
+    # Save final model and copy processor artifacts to output_dir root so the
+    # final output directory is directly usable by Gr00tPolicy and TRT export.
     trainer.save_model()
+    run_on_rank0(
+        shutil.copytree,
+        processor_dir,
+        output_dir,
+        dirs_exist_ok=True,
+        label="final processor copy",
+    )
     logging.info(f"Model saved to {output_dir}")
 
     if config.training.assert_loss_less_than is not None:

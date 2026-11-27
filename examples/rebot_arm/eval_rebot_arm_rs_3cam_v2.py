@@ -364,7 +364,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--use-rtc",
         action="store_true",
-        help="Enable server-side Real-Time Chunking (RTC) inpainting using previous chunk.",
+        help=(
+            "Experimental: enable server-side Real-Time Chunking (RTC) clean-prefix inpainting. "
+            "Disabled by default; not recommended for closed-loop N1.7 fine grasping."
+        ),
     )
     parser.add_argument("--rtc-ramp-rate", type=float, default=5.0)
     args = parser.parse_args(argv)
@@ -383,6 +386,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.gripper_delay_steps < 0:
         parser.error("--gripper-delay-steps must be >= 0")
     return args
+
+
+def _missing_motor_feedback(robot: SeeedB601RSFollower) -> list[str] | None:
+    """Return motor names whose CAN feedback state is still None, or None if unsupported."""
+    motors = getattr(robot, "motors", None)
+    if not isinstance(motors, dict) or not motors:
+        return None
+    missing: list[str] = []
+    for name, motor in motors.items():
+        get_state = getattr(motor, "get_state", None)
+        if callable(get_state) and get_state() is None:
+            missing.append(name)
+    return missing
+
+
+def capture_startup_observation(
+    robot: SeeedB601RSFollower,
+    *,
+    min_reads: int = 3,
+    max_attempts: int = 30,
+    retry_delay_s: float = 0.02,
+) -> tuple[dict[str, Any], bool]:
+    """Warm up cameras and wait for valid CAN feedback from every motor.
+
+    ``SeeedB601FollowerBase.get_observation()`` calls ``poll_feedback_once()`` and
+    falls back to ``0.0`` for any motor whose ``get_state()`` is still ``None``.
+    Polling right after ``connect()`` with zero delay can therefore return all zeros
+    before the first CAN feedback frames arrive. Retrying with a short delay ensures
+    every motor has reported live state before reading the startup pose.
+
+    Returns ``(observation, motor_feedback_verified)``.
+    """
+    observation: dict[str, Any] | None = None
+    last_missing: list[str] | None = None
+    for attempt in range(1, max_attempts + 1):
+        observation = robot.get_observation()
+        missing = _missing_motor_feedback(robot)
+        last_missing = missing
+        if missing is not None:
+            if not missing and attempt >= min_reads:
+                return observation, True
+        else:
+            state = observation_state(observation)
+            if attempt >= min_reads and not np.all(np.abs(state) < 1e-6):
+                return observation, False
+        if attempt < max_attempts:
+            time.sleep(retry_delay_s)
+
+    if last_missing:
+        raise RuntimeError(
+            "No CAN feedback received after "
+            f"{max_attempts} attempts (~{max_attempts * retry_delay_s:.2f} s) from motors: "
+            f"{', '.join(last_missing)}. Check CAN bus (can0) and motor power."
+        )
+    assert observation is not None
+    return observation, False
 
 
 def _print_timing_summary(
@@ -455,11 +514,15 @@ def main(argv: list[str] | None = None) -> int:
             recorder.open(list(robot.cameras.keys()))
             print(f"Async recording enabled -> {args.record_dir}")
 
-        observation: dict[str, Any] | None = None
-        for _ in range(3):
-            observation = robot.get_observation()
-        assert observation is not None
+        observation, motor_feedback_verified = capture_startup_observation(robot)
         candidate_startup_state = observation_state(observation).copy()
+        print(
+            "Startup physical state (deg):",
+            {
+                key: round(float(val), 2)
+                for key, val in zip(JOINT_KEYS, candidate_startup_state, strict=True)
+            },
+        )
         validate_command_state(
             physical_state_to_command_state(candidate_startup_state),
             field_name="startup command",
@@ -494,7 +557,11 @@ def main(argv: list[str] | None = None) -> int:
         while target_action_count is None or executed_actions < target_action_count:
             if first_chunk:
                 observation = preview_observation if not args.execute else robot.get_observation()
-                policy_observation = build_policy_observation(observation, args.instruction)
+                policy_observation = build_policy_observation(
+                    observation,
+                    args.instruction,
+                    allow_all_zero=motor_feedback_verified,
+                )
                 chunk_observation_step = executed_actions
                 t0 = time.monotonic()
                 action_chunk, _ = client.get_action(policy_observation)
@@ -580,7 +647,12 @@ def main(argv: list[str] | None = None) -> int:
                 if need_next_chunk and local_step == args.latency_steps:
                     obs_now = robot.get_observation()
                     pending_observation_step = executed_actions
-                    policy_observation = build_policy_observation(obs_now, args.instruction)
+                    missing_now = _missing_motor_feedback(robot)
+                    policy_observation = build_policy_observation(
+                        obs_now,
+                        args.instruction,
+                        allow_all_zero=(missing_now is not None and not missing_now),
+                    )
                     rtc_options = None
                     if (
                         args.use_rtc

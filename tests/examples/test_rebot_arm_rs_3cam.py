@@ -78,20 +78,16 @@ def test_trajectory_limiter_enforces_velocity_and_accel_limits_and_converges_fas
     assert np.all(cmds >= COMMAND_LOWER)
     assert np.all(cmds <= COMMAND_UPPER)
 
-    # Fine 1.0 deg final-approach adjustment: must converge much faster than legacy gain=0.35
-    fine_targets = np.tile(start + np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]), (8, 1))
-    cmds_fast, _, _ = limit_action_trajectory(fine_targets, start, np.zeros(7, dtype=np.float32))
-    cmds_slow, _, _ = limit_action_trajectory(
-        fine_targets, start, np.zeros(7, dtype=np.float32), tracking_gain=0.35
-    )
-    err_fast = np.max(np.abs(fine_targets[-1, :6] - cmds_fast[-1, :6]))
-    err_slow = np.max(np.abs(fine_targets[-1, :6] - cmds_slow[-1, :6]))
-    assert err_fast < 0.05
-    assert err_fast < err_slow
+    # Fine 1.0 deg final-approach adjustment: must converge smoothly with zero overshoot
+    fine_targets = np.tile(start + np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]), (16, 1))
+    cmds_fine, _, _ = limit_action_trajectory(fine_targets, start, np.zeros(7, dtype=np.float32))
+    err_fine = np.max(np.abs(fine_targets[-1, :6] - cmds_fine[-1, :6]))
+    assert err_fine < 0.05
+    assert np.max(cmds_fine[:, :6] - fine_targets[:, :6]) < 0.05
 
 
 def test_gripper_delay_and_pose_arrival_gate_prevent_premature_close():
-    """Gripper must stay phase-aligned with arm motion and wait while arm is far from target."""
+    """Opt-in gripper delay and pose-arrival gate hold gripper when arm is far from target."""
     start = np.array([0.0, 20.0, -40.0, 0.0, 0.0, 0.0, 35.0], dtype=np.float32)  # open=35
     # Arm still needs to move 10 deg, while model already asks gripper to close to 5 at step 0
     targets = np.tile(
@@ -104,6 +100,7 @@ def test_gripper_delay_and_pose_arrival_gate_prevent_premature_close():
         start,
         np.zeros(7, dtype=np.float32),
         gripper_delay_buffer=delay_buf,
+        gripper_gate_max_hold=3,
     )
     # During the first 2 delay steps + pose-arrival gate steps, gripper does NOT prematurely close.
     assert cmds[0, 6] == pytest.approx(35.0)
@@ -139,6 +136,14 @@ def test_build_policy_observation_and_validate_command_state():
     assert policy_obs["video"]["wrist"].shape == (1, 1, 48, 64, 3)
     assert policy_obs["state"]["single_arm"].shape == (1, 1, 6)
     assert policy_obs["state"]["gripper"].shape == (1, 1, 1)
+
+    zero_obs = {k: 0.0 for k in JOINT_KEYS}
+    for cam in ("wrist", "front", "side"):
+        zero_obs[cam] = np.zeros((48, 64, 3), dtype=np.uint8)
+    with pytest.raises(RuntimeError, match="All seven joint readings are zero"):
+        build_policy_observation(zero_obs, "pick up red cube")
+    verified_zero = build_policy_observation(zero_obs, "pick up red cube", allow_all_zero=True)
+    assert verified_zero["state"]["single_arm"].shape == (1, 1, 6)
 
     with pytest.raises(ValueError, match="outside B601-RS command limits"):
         validate_command_state(np.array([999.0, 0, 0, 0, 0, 0, 0]), field_name="test")

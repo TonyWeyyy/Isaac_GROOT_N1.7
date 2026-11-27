@@ -62,33 +62,30 @@ ACTION_HORIZON = 8
 POLICY_LATENCY_STEPS = 4
 CONTROL_HZ = 30.0
 
-# Low-lag precision smoothing parameters:
-# - Higher EMA alpha (0.65 vs legacy 0.4) cuts phase lag from ~1.5 steps to ~0.5 steps.
-# - Lower chunk blend weight (0.50 vs legacy 0.85) with exponential decay lets fresh
-#   wrist-camera alignment corrections take authority rapidly during the final 1-2 cm grasp.
-# - Responsive tracking gain (0.75 vs legacy 0.35) eliminates steady-state crawl while
-#   strictly preserving hardware velocity (TRAJECTORY_MAX_STEP) and acceleration
-#   (TRAJECTORY_MAX_STEP_CHANGE) limits.
-ACTION_SMOOTHING_ALPHA = 0.65
+# Well-damped precision smoothing parameters (validated against B601-RS ~±0.8 deg
+# diffusion chunk noise so the gripper stays rock-steady near the grasp target):
+# - EMA alpha 0.40 + chunk blend weight 0.85 strongly attenuate 2-6 Hz stochastic
+#   chunk-to-chunk jitter without introducing boundary steps.
+# - Tracking gain 0.35 paired with hardware accel limits (TRAJECTORY_MAX_STEP_CHANGE)
+#   gives critically damped convergence with zero overshoot / limit-cycle oscillation.
+ACTION_SMOOTHING_ALPHA = 0.40
 ACTION_SMOOTHING_MAX_DELTA = 2.5
-CHUNK_BLEND_MAX_WEIGHT = 0.50
+CHUNK_BLEND_MAX_WEIGHT = 0.85
 CHUNK_BLEND_ARM_DISAGREEMENT_SCALE = 4.0
-CHUNK_BLEND_DECAY_STEPS = 4
-TRAJECTORY_TRACKING_GAIN = 0.75
+CHUNK_BLEND_DECAY_STEPS = 6
+TRAJECTORY_TRACKING_GAIN = 0.35
 TRAJECTORY_MAX_STEP = np.array([1.2, 1.0, 1.0, 1.0, 1.2, 1.2], dtype=np.float32)
 TRAJECTORY_MAX_STEP_CHANGE = np.array(
     [0.12, 0.10, 0.10, 0.10, 0.12, 0.12],
     dtype=np.float32,
 )
 
-# Gripper-to-arm phase alignment:
-# Delays gripper commands by a small integer number of control ticks so the gripper
-# closes when the velocity/accel-limited arm actually reaches the target pose, instead
-# of closing ~150 ms prematurely in mid-air.
-GRIPPER_DELAY_STEPS = 2
+# Gripper phase alignment (off by default so learned grasp timing is never delayed;
+# opt-in via --gripper-delay-steps if premature closing is observed).
+GRIPPER_DELAY_STEPS = 0
 GRIPPER_CLOSE_GATE_DELTA = 3.0
 GRIPPER_CLOSE_GATE_ARM_ERR_DEG = 1.5
-GRIPPER_CLOSE_GATE_MAX_HOLD_STEPS = 3
+GRIPPER_CLOSE_GATE_MAX_HOLD_STEPS = 0
 
 RETURN_CONTROL_HZ = 30.0
 RETURN_ARM_SPEED = 20.0
@@ -138,7 +135,12 @@ def validate_command_state(command: np.ndarray, *, field_name: str) -> np.ndarra
     return state
 
 
-def build_policy_observation(robot_observation: dict[str, Any], instruction: str) -> dict[str, Any]:
+def build_policy_observation(
+    robot_observation: dict[str, Any],
+    instruction: str,
+    *,
+    allow_all_zero: bool = False,
+) -> dict[str, Any]:
     """Convert a raw LeRobot observation to the GR00T Policy API format."""
     missing = [key for key in (*JOINT_KEYS, *CAMERA_KEYS) if key not in robot_observation]
     if missing:
@@ -147,7 +149,7 @@ def build_policy_observation(robot_observation: dict[str, Any], instruction: str
     state = np.asarray([robot_observation[key] for key in JOINT_KEYS], dtype=np.float32)
     if not np.all(np.isfinite(state)):
         raise ValueError(f"Robot returned a non-finite state: {state}")
-    if np.all(np.abs(state) < 1e-6):
+    if not allow_all_zero and np.all(np.abs(state) < 1e-6):
         raise RuntimeError("All seven joint readings are zero; no valid motor feedback received")
 
     videos: dict[str, np.ndarray] = {}

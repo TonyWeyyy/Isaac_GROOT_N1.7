@@ -29,12 +29,14 @@ if REBOT_ARM_DIR not in sys.path:
 from rebot_control_utils import (  # noqa: E402
     COMMAND_LOWER,
     COMMAND_UPPER,
+    JOINT_DIRECTIONS,
     JOINT_KEYS,
     TRAJECTORY_MAX_STEP,
     TRAJECTORY_MAX_STEP_CHANGE,
     AsyncEpisodeRecorder,
     blend_overlapping_actions,
     build_policy_observation,
+    compute_edge_alignment_score,
     decode_action_chunk,
     encode_prev_action_for_rtc,
     limit_action_trajectory,
@@ -42,6 +44,7 @@ from rebot_control_utils import (  # noqa: E402
     smooth_action_segment,
     validate_command_state,
 )
+from align_dataset_command_space import convert_state_column  # noqa: E402
 
 
 def test_decode_action_chunk_clamps_to_hardware_limits_and_rejects_nan():
@@ -129,13 +132,42 @@ def test_chunk_blending_and_rtc_encoding():
 
 
 def test_build_policy_observation_and_validate_command_state():
-    obs = {k: 1.0 for k in JOINT_KEYS}
+    obs = {
+        "shoulder_pan.pos": 10.0,
+        "shoulder_lift.pos": 20.0,
+        "elbow_flex.pos": 30.0,
+        "wrist_flex.pos": -15.0,
+        "wrist_yaw.pos": 5.0,
+        "wrist_roll.pos": -8.0,
+        "gripper.pos": 120.0,
+    }
     for cam in ("wrist", "front", "side"):
         obs[cam] = np.zeros((48, 64, 3), dtype=np.uint8)
-    policy_obs = build_policy_observation(obs, "pick up red cube")
-    assert policy_obs["video"]["wrist"].shape == (1, 1, 48, 64, 3)
-    assert policy_obs["state"]["single_arm"].shape == (1, 1, 6)
-    assert policy_obs["state"]["gripper"].shape == (1, 1, 1)
+
+    # Default state_space="command" divides physical motor readings by JOINT_DIRECTIONS
+    policy_cmd = build_policy_observation(obs, "pick up red cube")
+    assert policy_cmd["video"]["wrist"].shape == (1, 1, 48, 64, 3)
+    assert policy_cmd["state"]["single_arm"].shape == (1, 1, 6)
+    assert policy_cmd["state"]["gripper"].shape == (1, 1, 1)
+    np.testing.assert_allclose(
+        policy_cmd["state"]["single_arm"][0, 0],
+        np.array([10.0, 20.0, -30.0, 15.0, -5.0, -8.0], dtype=np.float32),
+        atol=1e-5,
+    )
+    assert policy_cmd["state"]["gripper"][0, 0, 0] == pytest.approx(20.0)
+
+    # Legacy state_space="physical" preserves raw motor angles
+    policy_phys = build_policy_observation(obs, "pick up red cube", state_space="physical")
+    np.testing.assert_allclose(
+        policy_phys["state"]["single_arm"][0, 0],
+        np.array([10.0, 20.0, 30.0, -15.0, 5.0, -8.0], dtype=np.float32),
+        atol=1e-5,
+    )
+    assert policy_phys["state"]["gripper"][0, 0, 0] == pytest.approx(120.0)
+
+    # convert_state_column matches command-space transform identically
+    phys_arr = np.array([[10.0, 20.0, 30.0, -15.0, 5.0, -8.0, 120.0]], dtype=np.float32)
+    np.testing.assert_allclose(convert_state_column(phys_arr)[0], phys_arr[0] / JOINT_DIRECTIONS, atol=1e-5)
 
     zero_obs = {k: 0.0 for k in JOINT_KEYS}
     for cam in ("wrist", "front", "side"):
@@ -147,6 +179,14 @@ def test_build_policy_observation_and_validate_command_state():
 
     with pytest.raises(ValueError, match="outside B601-RS command limits"):
         validate_command_state(np.array([999.0, 0, 0, 0, 0, 0, 0]), field_name="test")
+
+
+def test_camera_edge_alignment_score():
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    img[16:48, 20:44] = 255
+    assert compute_edge_alignment_score(img, img) == pytest.approx(1.0, abs=1e-4)
+    shifted = np.roll(img, shift=12, axis=1)
+    assert compute_edge_alignment_score(img, shifted) < 0.6
 
 
 def test_async_episode_recorder_saves_actions_states_and_meta(tmp_path):

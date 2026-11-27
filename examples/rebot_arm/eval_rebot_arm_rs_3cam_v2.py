@@ -56,6 +56,7 @@ from rebot_control_utils import (  # noqa: E402
     CHUNK_BLEND_DECAY_STEPS,
     CHUNK_BLEND_MAX_WEIGHT,
     CONTROL_HZ,
+    DEFAULT_POLICY_STATE_SPACE,
     GRIPPER_DELAY_STEPS,
     JOINT_KEYS,
     POLICY_LATENCY_STEPS,
@@ -69,6 +70,7 @@ from rebot_control_utils import (  # noqa: E402
     action_dict,
     blend_overlapping_actions,
     build_policy_observation,
+    check_camera_alignment,
     decode_action_chunk,
     encode_prev_action_for_rtc,
     limit_action_trajectory,
@@ -350,8 +352,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="If set, save 3-camera mp4 + actions/states/latency log asynchronously to this dir.",
     )
     # Control & precision tuning knobs (all have safe validated defaults)
-    parser.add_argument("--action-horizon", type=int, default=ACTION_HORIZON)
-    parser.add_argument("--latency-steps", type=int, default=POLICY_LATENCY_STEPS)
+    parser.add_argument(
+        "--state-space",
+        choices=("command", "physical"),
+        default=DEFAULT_POLICY_STATE_SPACE,
+        help=(
+            "State space sent to the policy server: 'command' (default; matches "
+            "align_dataset_command_space.py + true RELATIVE single_arm) or "
+            "'physical' (raw motor angles for legacy checkpoints)."
+        ),
+    )
+    parser.add_argument(
+        "--trt-fast",
+        action="store_true",
+        help=(
+            "Low-latency preset for TensorRT policy servers (~52 ms E2E on 320px 3-cam): "
+            "sets --action-horizon 6 and --latency-steps 3 (100 ms async budget, 5 Hz replanning) "
+            "unless explicitly overridden."
+        ),
+    )
+    parser.add_argument("--action-horizon", type=int, default=None)
+    parser.add_argument("--latency-steps", type=int, default=None)
     parser.add_argument("--ema-alpha", type=float, default=ACTION_SMOOTHING_ALPHA)
     parser.add_argument("--chunk-blend-weight", type=float, default=CHUNK_BLEND_MAX_WEIGHT)
     parser.add_argument("--tracking-gain", type=float, default=TRAJECTORY_TRACKING_GAIN)
@@ -360,6 +381,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=GRIPPER_DELAY_STEPS,
         help="Delay gripper commands by N control steps to stay in phase with arm tracking lag.",
+    )
+    parser.add_argument(
+        "--reference-dataset",
+        default="",
+        help=(
+            "Optional LeRobot v2 training dataset path. When set, compares startup live "
+            "cameras against training episode 0 and saves an overlay image to detect camera shift."
+        ),
+    )
+    parser.add_argument(
+        "--alignment-output",
+        default="outputs/camera_alignment_check.jpg",
+        help="Output image path for --reference-dataset camera alignment overlay.",
     )
     parser.add_argument(
         "--use-rtc",
@@ -371,6 +405,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--rtc-ramp-rate", type=float, default=5.0)
     args = parser.parse_args(argv)
+    if args.action_horizon is None:
+        args.action_horizon = 6 if args.trt_fast else ACTION_HORIZON
+    if args.latency_steps is None:
+        args.latency_steps = 3 if args.trt_fast else POLICY_LATENCY_STEPS
     if args.duration_s < 0:
         parser.error("--duration-s must be non-negative (0 means unlimited)")
     if args.action_horizon < 1:
@@ -471,11 +509,11 @@ def main(argv: list[str] | None = None) -> int:
     effective_blend_weight = min(args.chunk_blend_weight, 0.25) if args.use_rtc else args.chunk_blend_weight
 
     print(
-        f"Control: {CONTROL_HZ:g} Hz, horizon={args.action_horizon}, "
-        f"latency_steps={args.latency_steps} (async budget={async_budget_ms:.1f} ms), "
-        f"ema_alpha={args.ema_alpha}, blend_weight={effective_blend_weight}, "
-        f"tracking_gain={args.tracking_gain}, gripper_delay={args.gripper_delay_steps}, "
-        f"rtc={args.use_rtc}"
+        f"Control: {CONTROL_HZ:g} Hz, state_space={args.state_space}, "
+        f"horizon={args.action_horizon}, latency_steps={args.latency_steps} "
+        f"(async budget={async_budget_ms:.1f} ms), ema_alpha={args.ema_alpha}, "
+        f"blend_weight={effective_blend_weight}, tracking_gain={args.tracking_gain}, "
+        f"gripper_delay={args.gripper_delay_steps}, rtc={args.use_rtc}"
     )
 
     client = PolicyClient(
@@ -529,6 +567,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         startup_state = candidate_startup_state
 
+        if args.reference_dataset:
+            live_frames = {k: np.asarray(observation[k]) for k in CAMERA_KEYS if k in observation}
+            check_camera_alignment(
+                live_frames,
+                args.reference_dataset,
+                output_path=args.alignment_output,
+            )
+
         preview_observation = observation
         if not args.execute:
             robot.disable_torque()
@@ -561,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
                     observation,
                     args.instruction,
                     allow_all_zero=motor_feedback_verified,
+                    state_space=args.state_space,
                 )
                 chunk_observation_step = executed_actions
                 t0 = time.monotonic()
@@ -652,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
                         obs_now,
                         args.instruction,
                         allow_all_zero=(missing_now is not None and not missing_now),
+                        state_space=args.state_space,
                     )
                     rtc_options = None
                     if (

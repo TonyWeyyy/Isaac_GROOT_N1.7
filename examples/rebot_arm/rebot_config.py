@@ -31,14 +31,14 @@ rebot_3cam_config = {
             "gripper",
         ],
         action_configs=[
-            # single_arm: ABSOLUTE target joint commands.
-            # NOTE: In Seeed reBot B601-RS datasets, observation.state (physical motor angles)
-            # and action (command angles) have opposite signs on elbow_flex/wrist_flex/wrist_yaw
-            # (JOINT_DIRECTIONS = [1, 1, -1, -1, -1, 1, 6]). Using RELATIVE computes
-            # action - state ≈ -2 * state on those 3 joints, doubling the normalization span
-            # (~200 deg vs ~100 deg) and hurting 1-2 cm final-approach precision.
+            # single_arm: RELATIVE target joint deltas in command space.
+            # Requires command-space-aligned observation.state (produced by
+            # examples/rebot_arm/align_dataset_command_space.py) and client
+            # --state-space command, compressing elbow/wrist step-0 span from
+            # ~200 deg (raw inverted-sign) / ~100 deg (absolute) down to ~20 deg
+            # (~5-10x higher normalization resolution for 1-2 cm final grasping).
             ActionConfig(
-                rep=ActionRepresentation.ABSOLUTE,
+                rep=ActionRepresentation.RELATIVE,
                 type=ActionType.NON_EEF,  # joint-space, not end-effector
                 format=ActionFormat.DEFAULT,
             ),

@@ -68,13 +68,15 @@ CONTROL_HZ = 30.0
 #   chunk-to-chunk jitter without introducing boundary steps.
 # - Tracking gain 0.35 paired with hardware accel limits (TRAJECTORY_MAX_STEP_CHANGE)
 #   gives critically damped convergence with zero overshoot / limit-cycle oscillation.
+# - Slightly raised velocity ceiling (TRAJECTORY_MAX_STEP, <=42 deg/s = 0.73 rad/s)
+#   speeds up large transit moves while keeping fine near-target motion identically damped.
 ACTION_SMOOTHING_ALPHA = 0.40
 ACTION_SMOOTHING_MAX_DELTA = 2.5
 CHUNK_BLEND_MAX_WEIGHT = 0.85
 CHUNK_BLEND_ARM_DISAGREEMENT_SCALE = 4.0
 CHUNK_BLEND_DECAY_STEPS = 6
 TRAJECTORY_TRACKING_GAIN = 0.35
-TRAJECTORY_MAX_STEP = np.array([1.2, 1.0, 1.0, 1.0, 1.2, 1.2], dtype=np.float32)
+TRAJECTORY_MAX_STEP = np.array([1.4, 1.2, 1.2, 1.2, 1.4, 1.4], dtype=np.float32)
 TRAJECTORY_MAX_STEP_CHANGE = np.array(
     [0.12, 0.10, 0.10, 0.10, 0.12, 0.12],
     dtype=np.float32,
@@ -86,6 +88,12 @@ GRIPPER_DELAY_STEPS = 0
 GRIPPER_CLOSE_GATE_DELTA = 3.0
 GRIPPER_CLOSE_GATE_ARM_ERR_DEG = 1.5
 GRIPPER_CLOSE_GATE_MAX_HOLD_STEPS = 0
+
+# Default state representation sent to the GR00T policy server:
+# - "command": converts physical motor readings via physical_state_to_command_state()
+#   to match datasets processed by align_dataset_command_space.py (true RELATIVE arm).
+# - "physical": sends raw physical motor angles (legacy checkpoints).
+DEFAULT_POLICY_STATE_SPACE = "command"
 
 RETURN_CONTROL_HZ = 30.0
 RETURN_ARM_SPEED = 20.0
@@ -140,17 +148,38 @@ def build_policy_observation(
     instruction: str,
     *,
     allow_all_zero: bool = False,
+    state_space: str = DEFAULT_POLICY_STATE_SPACE,
 ) -> dict[str, Any]:
-    """Convert a raw LeRobot observation to the GR00T Policy API format."""
+    """Convert a raw LeRobot observation to the GR00T Policy API format.
+
+    Args:
+        robot_observation: Raw dict from ``SeeedB601RSFollower.get_observation()``.
+        instruction: Natural-language task prompt.
+        allow_all_zero: If True, permit an all-zero joint reading (only when motor
+            CAN feedback has already been verified non-None at the driver level).
+        state_space: ``"command"`` (converts physical motor angles into command space
+            via ``physical_state_to_command_state`` so ``single_arm`` RELATIVE deltas
+            share the same sign/scale as ``action``) or ``"physical"`` (raw physical
+            motor angles for legacy checkpoints).
+    """
+    if state_space not in ("command", "physical"):
+        raise ValueError(f"state_space must be 'command' or 'physical', got {state_space!r}")
+
     missing = [key for key in (*JOINT_KEYS, *CAMERA_KEYS) if key not in robot_observation]
     if missing:
         raise KeyError(f"Robot observation is missing keys: {missing}")
 
-    state = np.asarray([robot_observation[key] for key in JOINT_KEYS], dtype=np.float32)
-    if not np.all(np.isfinite(state)):
-        raise ValueError(f"Robot returned a non-finite state: {state}")
-    if not allow_all_zero and np.all(np.abs(state) < 1e-6):
+    physical_state = np.asarray([robot_observation[key] for key in JOINT_KEYS], dtype=np.float32)
+    if not np.all(np.isfinite(physical_state)):
+        raise ValueError(f"Robot returned a non-finite state: {physical_state}")
+    if not allow_all_zero and np.all(np.abs(physical_state) < 1e-6):
         raise RuntimeError("All seven joint readings are zero; no valid motor feedback received")
+
+    state = (
+        physical_state_to_command_state(physical_state)
+        if state_space == "command"
+        else physical_state
+    )
 
     videos: dict[str, np.ndarray] = {}
     for key in CAMERA_KEYS:
@@ -511,3 +540,143 @@ class AsyncEpisodeRecorder:
             f"actions={len(self.actions)}, states={len(self.states)}, "
             f"dropped_frames={self.dropped_frames})"
         )
+
+
+def _read_reference_frame_rgb(video_path: Path, frame_idx: int = 0) -> np.ndarray | None:
+    """Read a single RGB frame from an MP4 (supports AV1 via PyAV/torchcodec and H264 via OpenCV)."""
+    if not video_path.exists():
+        return None
+    # 1. PyAV (installed in lerobot env; reliably decodes software AV1)
+    try:
+        import av
+
+        with av.open(str(video_path)) as container:
+            for i, frame in enumerate(container.decode(video=0)):
+                if i == frame_idx:
+                    return frame.to_ndarray(format="rgb24")
+    except Exception:
+        pass
+    # 2. torchcodec (installed in Isaac-GR00T venv)
+    try:
+        from torchcodec.decoders import VideoDecoder
+
+        dec = VideoDecoder(str(video_path), num_ffmpeg_threads=1)
+        idx = min(max(0, frame_idx), len(dec) - 1)
+        tensor = dec.get_frames_at([idx]).data[0]  # (C, H, W)
+        return tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+    except Exception:
+        pass
+    # 3. OpenCV fallback
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(video_path))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, bgr = cap.read()
+        cap.release()
+        if ok and bgr is not None:
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    except Exception:
+        pass
+    return None
+
+
+def compute_edge_alignment_score(live_rgb: np.ndarray, ref_rgb: np.ndarray) -> float:
+    """Compute a [0, 1] Sobel edge-magnitude cosine similarity between two RGB frames.
+
+    Invariant to global brightness changes while sensitive to camera bump/shift.
+    """
+    live = np.asarray(live_rgb, dtype=np.float32)
+    ref = np.asarray(ref_rgb, dtype=np.float32)
+    if live.shape[:2] != ref.shape[:2]:
+        import cv2
+
+        ref = cv2.resize(ref, (live.shape[1], live.shape[0]), interpolation=cv2.INTER_AREA)
+    gray_l = 0.299 * live[..., 0] + 0.587 * live[..., 1] + 0.114 * live[..., 2]
+    gray_r = 0.299 * ref[..., 0] + 0.587 * ref[..., 1] + 0.114 * ref[..., 2]
+
+    def _edge_mag(g: np.ndarray) -> np.ndarray:
+        gx = np.abs(g[:, 2:] - g[:, :-2])[1:-1, :]
+        gy = np.abs(g[2:, :] - g[:-2, :])[:, 1:-1]
+        return np.hypot(gx, gy)
+
+    el = _edge_mag(gray_l).ravel()
+    er = _edge_mag(gray_r).ravel()
+    denom = float(np.linalg.norm(el) * np.linalg.norm(er))
+    if denom < 1e-8:
+        return 0.0
+    return float(np.clip(np.dot(el, er) / denom, 0.0, 1.0))
+
+
+def check_camera_alignment(
+    live_frames_rgb: dict[str, np.ndarray],
+    reference_dataset_dir: str | Path,
+    output_path: str | Path | None = None,
+    *,
+    episode_idx: int = 0,
+    frame_idx: int = 0,
+    warn_threshold: float = 0.45,
+) -> dict[str, float]:
+    """Compare live camera frames against training dataset reference frames at startup.
+
+    Saves a 3-row visual diagnostic sheet (LIVE | TRAIN REF | 50/50 OVERLAY) if
+    ``output_path`` is provided, and returns per-camera edge alignment scores in [0, 1].
+    """
+    ref_root = Path(reference_dataset_dir).expanduser()
+    scores: dict[str, float] = {}
+    columns: list[np.ndarray] = []
+
+    try:
+        import cv2
+    except ImportError:
+        cv2 = None  # type: ignore[assignment]
+
+    for cam in CAMERA_KEYS:
+        if cam not in live_frames_rgb:
+            continue
+        video_path = (
+            ref_root
+            / "videos"
+            / "chunk-000"
+            / f"observation.images.{cam}"
+            / f"episode_{episode_idx:06d}.mp4"
+        )
+        ref_rgb = _read_reference_frame_rgb(video_path, frame_idx=frame_idx)
+        if ref_rgb is None:
+            print(f"Camera alignment: skipped {cam} (could not read {video_path})")
+            continue
+        live_rgb = np.asarray(live_frames_rgb[cam], dtype=np.uint8)
+        score = compute_edge_alignment_score(live_rgb, ref_rgb)
+        scores[cam] = score
+
+        status = "OK"
+        if cam in ("front", "side") and score < warn_threshold:
+            status = "WARNING: possible camera shift!"
+        print(f"Camera alignment [{cam:5s}]: edge_score={score:.3f} ({status})")
+
+        if cv2 is not None and output_path is not None:
+            w, h = 320, 240
+            l_bgr = cv2.resize(cv2.cvtColor(live_rgb, cv2.COLOR_RGB2BGR), (w, h))
+            r_bgr = cv2.resize(cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2BGR), (w, h))
+            ov_bgr = cv2.addWeighted(l_bgr, 0.5, r_bgr, 0.5, 0.0)
+            cv2.putText(l_bgr, f"LIVE: {cam}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(r_bgr, f"REF: {cam}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            color = (0, 255, 0) if (cam == "wrist" or score >= warn_threshold) else (0, 0, 255)
+            cv2.putText(
+                ov_bgr,
+                f"OVERLAY {cam} ({score:.2f})",
+                (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+            columns.append(np.vstack([l_bgr, r_bgr, ov_bgr]))
+
+    if cv2 is not None and output_path is not None and columns:
+        out_file = Path(output_path).expanduser()
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_file), np.hstack(columns))
+        print(f"Camera alignment comparison saved -> {out_file}")
+
+    return scores

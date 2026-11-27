@@ -482,7 +482,11 @@ class Gr00tPolicy(BasePolicy):
         }
         return casted_action, {}
 
-    def warmup(self, image_size: tuple[int, int] = (256, 256)) -> None:
+    def warmup(
+        self,
+        image_size: tuple[int, int] = (256, 256),
+        instruction: str = "warmup",
+    ) -> None:
         """Run one dummy inference pass to warm up CUDA/cuDNN/TRT/FlashAttention kernels."""
         height, width = image_size
         video_horizon = len(self.modality_configs["video"].delta_indices)
@@ -502,12 +506,22 @@ class Gr00tPolicy(BasePolicy):
                 for k in self.modality_configs["state"].modality_keys
             },
             "language": {
-                k: [["warmup"]] for k in self.modality_configs["language"].modality_keys
+                k: [[instruction]] for k in self.modality_configs["language"].modality_keys
             },
         }
         self.get_action(dummy_obs)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        # If an optimized TensorRT action-head CUDA graph was captured on the generic
+        # dummy "warmup" prompt, clear it so the first real task prompt captures the
+        # graph for its actual token sequence length instead of falling back to eager TRT.
+        if instruction == "warmup":
+            runner = getattr(
+                getattr(self.model, "action_head", None), "_trt_optimization_runner", None
+            )
+            reset_fn = getattr(runner, "reset_cuda_graph", None)
+            if callable(reset_fn):
+                reset_fn()
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

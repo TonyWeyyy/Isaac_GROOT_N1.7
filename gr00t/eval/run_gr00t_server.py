@@ -22,6 +22,13 @@ from pathlib import Path
 import sys
 import time
 
+# Prevent OpenMP/OpenCV/TensorRT CPU thread-pool oversubscription during single-sample
+# policy serving (on 20-core CPUs with TensorRT loaded, unbounded thread contention can
+# inflate CPU preprocessing from ~5 ms to >60 ms). Callers can still override via env vars.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig
 from gr00t.deployment.modes import InferenceMode
@@ -108,8 +115,24 @@ class ServerConfig:
     warmup_image_size: tuple[int, int] = (480, 640)
     """(height, width) used for startup warmup dummy frames"""
 
+    warmup_instruction: str = "warmup"
+    """Optional task instruction for startup warmup (matches TRT CUDA-graph token length)"""
+
 
 def main(config: ServerConfig):
+    try:
+        import cv2
+
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        torch.set_num_threads(min(2, max(1, torch.get_num_threads())))
+    except Exception:
+        pass
+
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
     print("Starting GR00T inference server...")
     print(f"  Embodiment tag: {config.embodiment_tag}")
@@ -161,7 +184,10 @@ def main(config: ServerConfig):
 
         if config.warmup:
             t0 = time.monotonic()
-            policy.warmup(image_size=config.warmup_image_size)
+            policy.warmup(
+                image_size=config.warmup_image_size,
+                instruction=config.warmup_instruction,
+            )
             print(f"  Warmup completed in {(time.monotonic() - t0) * 1000:.1f} ms")
     elif config.dataset_path is not None:
         if config.execution_horizon is None:

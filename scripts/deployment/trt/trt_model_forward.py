@@ -530,6 +530,16 @@ class OptimizedActionHeadRunner:
         state.graph = graph
         state.output = output
 
+    def reset_cuda_graph(self):
+        """Release any captured CUDA graph so the next signature captures fresh."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if self._graph_state is not None:
+            self._graph_state.graph = None
+            self._graph_state = None
+        self._graph_signature = None
+        self._eager_signatures_warned.clear()
+
     def close(self):
         if self.closed:
             return
